@@ -41,96 +41,170 @@
   </div>
 
   <script>
-    // ======== 設定（決め打ち） ========
-    const DB_NAME = 'AppKVDB';        // 適当なDB名
-    const DB_VERSION = 1;             // 変更したらonupgradeneededが走る
-    const STORE_NAME = 'kv';          // 決め打ちのオブジェクトストア
+// ======== 設定（決め打ち） ========
+const DB_NAME = 'AppKVDB';        // DB名（固定）
+const DB_VERSION = 1;             // スキーマ更新時に上げる
+const STORE_NAME = 'kv';          // オブジェクトストア名（固定）
 
-    // ======== 基本ユーティリティ ========
-    function ensureSupport(){
-      if(!('indexedDB' in window)){
-        throw new Error('このブラウザは IndexedDB をサポートしていません。');
+// 暗号化設定（デモ用：固定パスフレーズ & ソルト）
+const PASSPHRASE = 'AppKVDB#FixedKey#2025-09';       // 決め打ちの暗号化キー（パスフレーズ）
+const SALT_STR   = 'AppKVDB::kv::salt-v1';           // 決め打ちソルト（変更すると復号不可に注意）
+const PBKDF2_ITERATIONS = 150_000;                   // 反復回数（体感バランス用）
+const AES_KEY_LENGTH = 256;                          // 256-bit AES
+const GCM_IV_BYTES = 12;                             // AES-GCM の推奨 IV 長
+
+// ======== 基本ユーティリティ ========
+function ensureSupport(){
+  if(!('indexedDB' in window)) throw new Error('このブラウザは IndexedDB をサポートしていません。');
+  if(!window.crypto?.subtle)  throw new Error('このブラウザは WebCrypto(SubtleCrypto) をサポートしていません。');
+}
+
+function openDB(){
+  ensureSupport();
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if(!db.objectStoreNames.contains(STORE_NAME)){
+        db.createObjectStore(STORE_NAME, { keyPath: 'key' });
       }
-    }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+    req.onblocked = () => console.warn('DB更新がブロックされています。古いタブを閉じてください');
+  });
+}
 
-    function openDB(){
-      ensureSupport();
-      return new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, DB_VERSION);
-        req.onupgradeneeded = (ev) => {
-          const db = req.result;
-          // まだストアが無ければ作成
-          if(!db.objectStoreNames.contains(STORE_NAME)){
-            db.createObjectStore(STORE_NAME, { keyPath: 'key' });
-          }
-        };
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
-        req.onblocked = () => console.warn('DB更新がブロックされています。古いタブを閉じてください');
-      });
-    }
+// 取引(tx)の完了/失敗をPromise化
+function awaitTx(tx, db){
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => { try{ db && db.close(); } catch{} resolve(); };
+    tx.onerror    = () => { try{ db && db.close(); } catch{} reject(tx.error); };
+    tx.onabort    = () => { try{ db && db.close(); } catch{} reject(tx.error || new Error('Transaction aborted')); };
+  });
+}
 
-    // 取引(tx)の完了/失敗をPromise化
-    function awaitTx(tx, db){
-      return new Promise((resolve, reject) => {
-        tx.oncomplete = () => { db && db.close(); resolve(); };
-        tx.onerror = () => { db && db.close(); reject(tx.error); };
-        tx.onabort = () => { db && db.close(); reject(tx.error || new Error('Transaction aborted')); };
-      });
-    }
+// ======== base64 ヘルパ ========
+function bufToB64(buf){
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for(let i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+function b64ToBuf(b64){
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
 
-    // ======== 公開API ========
-    // 任意の値(Structured Clone対応)を保存
-    async function putData(key, value){
-      if(typeof key !== 'string' || !key) throw new Error('key は非空の文字列で指定してください');
-      const db = await openDB();
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
-      store.put({ key, value, updatedAt: new Date().toISOString() });
-      await awaitTx(tx, db);
-    }
+// ======== キー導出（PBKDF2 -> AES-GCM） ========
+let _cachedAesKey = null;
+async function getAesKey(){
+  if(_cachedAesKey) return _cachedAesKey;
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', enc.encode(PASSPHRASE), 'PBKDF2', false, ['deriveKey']
+  );
+  _cachedAesKey = await crypto.subtle.deriveKey(
+    { name:'PBKDF2', salt: enc.encode(SALT_STR), iterations: PBKDF2_ITERATIONS, hash:'SHA-256' },
+    keyMaterial,
+    { name:'AES-GCM', length: AES_KEY_LENGTH },
+    false,
+    ['encrypt','decrypt']
+  );
+  return _cachedAesKey;
+}
 
-    // 値を取得（存在しない場合は undefined を返す）
-    async function getData(key){
-      if(typeof key !== 'string' || !key) throw new Error('key は非空の文字列で指定してください');
-      const db = await openDB();
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const store = tx.objectStore(STORE_NAME);
-      const req = store.get(key);
-      const value = await new Promise((resolve, reject) => {
-        req.onsuccess = () => resolve(req.result ? req.result.value : undefined);
-        req.onerror = () => reject(req.error);
-      });
-      db.close();
-      return value;
-    }
+// ======== 暗号化 / 復号 ========
+async function encryptValue(value){
+  // value を JSON 文字列にシリアライズして暗号化
+  const key = await getAesKey();
+  const iv = crypto.getRandomValues(new Uint8Array(GCM_IV_BYTES));
+  const enc = new TextEncoder();
+  const plaintext = enc.encode(JSON.stringify(value));
+  const ciphertext = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, plaintext);
+  return {
+    alg: 'AES-GCM',
+    iv_b64: bufToB64(iv.buffer),
+    data_b64: bufToB64(ciphertext),
+  };
+}
 
-    // 便利：削除/全キー
-    async function deleteData(key){
-      const db = await openDB();
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      tx.objectStore(STORE_NAME).delete(key);
-      await awaitTx(tx, db);
-    }
+async function decryptValue(record){
+  // 平文フォーマット（後方互換）：{ key, value, updatedAt }
+  if (record && 'value' in record && !('data_b64' in record)) {
+    return record.value;
+  }
+  // 暗号フォーマット：{ key, alg, iv_b64, data_b64, updatedAt }
+  if (!record || !record.data_b64 || !record.iv_b64) return undefined;
+  const key = await getAesKey();
+  const iv  = new Uint8Array(b64ToBuf(record.iv_b64));
+  const data= b64ToBuf(record.data_b64);
+  const decrypted = await crypto.subtle.decrypt({ name:'AES-GCM', iv }, key, data);
+  const dec = new TextDecoder();
+  return JSON.parse(dec.decode(new Uint8Array(decrypted)));
+}
 
-    async function getAllKeys(){
-      const db = await openDB();
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const store = tx.objectStore(STORE_NAME);
-      const req = store.getAllKeys();
-      const keys = await new Promise((resolve, reject) => {
-        req.onsuccess = () => resolve(req.result || []);
-        req.onerror = () => reject(req.error);
-      });
-      db.close();
-      return keys;
-    }
+// ======== 公開API（暗号化対応） ========
+async function putData(key, value){
+  if (typeof key !== 'string' || !key) {
+    throw new Error('key は非空の文字列で指定してください');
+  }
 
-    // グローバル公開
-    window.putData = putData;
-    window.getData = getData;
-    window.deleteData = deleteData;
-    window.getAllKeys = getAllKeys;
+  // 1) 先に重い処理（暗号化など）を済ませる
+  const sealed = await encryptValue(value);
+
+  // 2) それからトランザクションを開始し、すぐにリクエストを発行
+  const db = await openDB();
+  const tx = db.transaction(STORE_NAME, 'readwrite');
+  tx.objectStore(STORE_NAME).put({ key, ...sealed, updatedAt: new Date().toISOString() });
+
+  // 3) トランザクション完了を待つ
+  await awaitTx(tx, db);
+}
+
+async function getData(key){
+  if(typeof key !== 'string' || !key) throw new Error('key は非空の文字列で指定してください');
+  const db = await openDB();
+  const tx = db.transaction(STORE_NAME, 'readonly');
+  const store = tx.objectStore(STORE_NAME);
+  const req = store.get(key);
+  const record = await new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result || undefined);
+    req.onerror = () => reject(req.error);
+  });
+  db.close();
+  if(record === undefined) return undefined;
+  return await decryptValue(record);
+}
+
+async function deleteData(key){
+  const db = await openDB();
+  const tx = db.transaction(STORE_NAME, 'readwrite');
+  tx.objectStore(STORE_NAME).delete(key);
+  await awaitTx(tx, db);
+}
+
+async function getAllKeys(){
+  const db = await openDB();
+  const tx = db.transaction(STORE_NAME, 'readonly');
+  const store = tx.objectStore(STORE_NAME);
+  const req = store.getAllKeys();
+  const keys = await new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror   = () => reject(req.error);
+  });
+  db.close();
+  return keys;
+}
+
+// グローバル公開
+window.putData = putData;
+window.getData = getData;
+window.deleteData = deleteData;
+window.getAllKeys = getAllKeys;
+
 
     // ======== デモUI ========
     const $ = (sel) => document.querySelector(sel);
